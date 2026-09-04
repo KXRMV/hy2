@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ─── Hysteria 2 Installer for Ubuntu 24.04 ───
-# Usage: bash <(curl -Ls https://raw.githubusercontent.com/YukiKras/vless-scripts/refs/heads/main/hysteria-install.sh)
+# Usage: bash <(curl -Ls https://raw.githubusercontent.com/KXRMV/hy2/main/hysteria-install.sh)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -13,6 +13,7 @@ NC='\033[0m'
 HYSTERIA_DIR="/etc/hysteria"
 HYSTERIA_BIN="/usr/local/bin/hysteria"
 SERVICE_FILE="/etc/systemd/system/hysteria-server.service"
+GH_REPO="apernet/hysteria"
 
 info()  { echo -e "${CYAN}[INFO]${NC} $*"; }
 ok()    { echo -e "${GREEN}[OK]${NC} $*"; }
@@ -24,28 +25,15 @@ err()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 # URL-encode a string (percent-encoding, byte-safe)
 urlencode() {
     local LC_ALL=C
-    local str="$1" encoded="" i c o
+    local str="$1" encoded="" i c
     for (( i = 0; i < ${#str}; i++ )); do
         c="${str:i:1}"
         case "$c" in
             [a-zA-Z0-9.~_-]) encoded+="$c" ;;
-            *)
-                o=$(printf '%o' "'$c" 2>/dev/null) || o=0
-                if [[ "$o" -eq 0 ]]; then
-                    # Handle single quote and null
-                    if [[ "$c" == "'" ]]; then
-                        encoded+="%27"
-                    else
-                        encoded+="%00"
-                    fi
-                else
-                    printf -v hex '%%%02X' "'$c"
-                    encoded+="$hex"
-                fi
-                ;;
+            *) printf -v c '%%%02X' "'$c"; encoded+="$c" ;;
         esac
     done
-    echo "$encoded"
+    printf '%s' "$encoded"
 }
 
 # Detect the default network interface
@@ -75,6 +63,10 @@ validate_mport_range() {
     return 0
 }
 
+# iptables and ufw spell port ranges with a colon, the hy2 URI with a hyphen.
+# Passing "20000-40000" to iptables is a syntax error, so convert on the way in.
+to_colon_range() { printf '%s' "${1/-/:}"; }
+
 # Read a field from config.yaml safely
 config_get_auth_password() {
     awk '
@@ -97,13 +89,11 @@ config_get_obfs_password() {
 }
 
 config_get_port() {
-    grep -oP '(?<=^listen: :)\d+' "$HYSTERIA_DIR/config.yaml"
+    grep -oP '(?<=^listen: :)\d+' "$HYSTERIA_DIR/config.yaml" || true
 }
 
 config_get_sni() {
-    grep -oP '(?<=sni=)[^&]+' <<< "$(grep -oP '(?<=url: https://)\S+' "$HYSTERIA_DIR/config.yaml" 2>/dev/null)" 2>/dev/null \
-        || grep -oP '(?<=url: https://)\S+' "$HYSTERIA_DIR/config.yaml" 2>/dev/null \
-        || echo "web.max.ru"
+    grep -oP '(?<=url: https://)\S+' "$HYSTERIA_DIR/config.yaml" 2>/dev/null || echo "web.max.ru"
 }
 
 # ─── Pre-checks ───
@@ -113,6 +103,7 @@ config_get_sni() {
 DEPS_TO_INSTALL=()
 command -v curl    >/dev/null || DEPS_TO_INSTALL+=(curl)
 command -v openssl >/dev/null || DEPS_TO_INSTALL+=(openssl)
+command -v iptables >/dev/null || DEPS_TO_INSTALL+=(iptables)
 if [[ ${#DEPS_TO_INSTALL[@]} -gt 0 ]]; then
     apt-get update && apt-get install -y "${DEPS_TO_INSTALL[@]}"
 fi
@@ -146,14 +137,46 @@ show_menu() {
 }
 
 # ─── Detect server IP (IPv4 with IPv6 fallback) ───
+# curl without -f exits 0 on an HTTP error page, so the old "||" chain never
+# reached its fallbacks. Check for a non-empty body instead of the exit code.
 detect_server_ip() {
-    local ip=""
-    ip=$(curl -s4 --max-time 5 ifconfig.me 2>/dev/null) \
-        || ip=$(curl -s4 --max-time 5 icanhazip.com 2>/dev/null) \
-        || ip=$(curl -s6 --max-time 5 ifconfig.me 2>/dev/null) \
-        || ip=$(curl -s6 --max-time 5 icanhazip.com 2>/dev/null) \
-        || ip=""
-    echo "$ip"
+    local ip="" src
+    for src in "-4 https://ifconfig.me" "-4 https://icanhazip.com" \
+               "-6 https://ifconfig.me" "-6 https://icanhazip.com"; do
+        # shellcheck disable=SC2086
+        ip=$(curl -fsS --max-time 5 $src 2>/dev/null | tr -d '[:space:]') || ip=""
+        [[ -n "$ip" ]] && { printf '%s' "$ip"; return 0; }
+    done
+    return 0
+}
+
+# ─── Resolve the download URL ───
+# The GitHub API answers 301 for this repo (it moved to HyNetworks/hysteria),
+# so the request MUST follow redirects. Without -L the body is a "Moved
+# Permanently" stub, grep matches nothing, and under `set -euo pipefail` the
+# script dies silently before it can print an error.
+resolve_download_url() {
+    local arch="$1" api_json="" url=""
+
+    api_json=$(curl -fsSL --max-time 15 \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/${GH_REPO}/releases/latest" 2>/dev/null) || api_json=""
+
+    if [[ -n "$api_json" ]]; then
+        url=$(grep -oP "(?<=\"browser_download_url\": \")[^\"]*hysteria-linux-${arch}(?=\")" \
+              <<< "$api_json" | head -1) || url=""
+    fi
+
+    # Fallback: the API is rate-limited per IP, so fall back to the redirect
+    # that /releases/latest serves to browsers.
+    if [[ -z "$url" ]]; then
+        local tag
+        tag=$(curl -fsSLo /dev/null -w '%{url_effective}' --max-time 15 \
+              "https://github.com/${GH_REPO}/releases/latest" 2>/dev/null | sed 's|.*/tag/||') || tag=""
+        [[ -n "$tag" ]] && url="https://github.com/${GH_REPO}/releases/download/${tag}/hysteria-linux-${arch}"
+    fi
+
+    printf '%s' "$url"
 }
 
 # ─── Install ───
@@ -173,18 +196,27 @@ install_hysteria() {
         *) err "Unsupported architecture: $ARCH" ;;
     esac
 
-    DOWNLOAD_URL=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest \
-        | grep "browser_download_url.*hysteria-linux-${HY_ARCH}\"" \
-        | head -1 | cut -d '"' -f 4)
+    DOWNLOAD_URL=$(resolve_download_url "$HY_ARCH")
+    [[ -z "$DOWNLOAD_URL" ]] && err "Failed to fetch download URL (GitHub API unreachable or rate-limited)"
+    info "Source: $DOWNLOAD_URL"
 
-    [[ -z "$DOWNLOAD_URL" ]] && err "Failed to fetch download URL"
-
-    curl -Lo "$HYSTERIA_BIN" "$DOWNLOAD_URL"
-    chmod +x "$HYSTERIA_BIN"
+    # Download to a temp file first: -f keeps an HTML error page from being
+    # written over a working binary.
+    local tmp_bin
+    tmp_bin=$(mktemp)
+    if ! curl -fLo "$tmp_bin" --max-time 120 "$DOWNLOAD_URL"; then
+        rm -f "$tmp_bin"
+        err "Download failed: $DOWNLOAD_URL"
+    fi
+    chmod +x "$tmp_bin"
+    if ! "$tmp_bin" version >/dev/null 2>&1; then
+        rm -f "$tmp_bin"
+        err "Downloaded file is not a working hysteria binary"
+    fi
+    mv -f "$tmp_bin" "$HYSTERIA_BIN"
     ok "Binary installed: $HYSTERIA_BIN"
 
-    # Version check
-    "$HYSTERIA_BIN" version
+    "$HYSTERIA_BIN" version | head -5
 
     # ─── Gather settings ───
     echo ""
@@ -197,9 +229,11 @@ install_hysteria() {
         info "Detected server IP: $SERVER_IP"
     fi
 
+    # 443/udp is widely filtered by ISPs; QUIC has no TCP fallback, so a blocked
+    # port looks exactly like a dead server. 8443 is a safer default.
     while true; do
-        read -rp "Port [443]: " PORT
-        PORT=${PORT:-443}
+        read -rp "Port [8443]: " PORT
+        PORT=${PORT:-8443}
         if validate_port "$PORT"; then
             break
         fi
@@ -228,12 +262,16 @@ install_hysteria() {
     SNI_DOMAIN=${SNI_DOMAIN:-web.max.ru}
 
     # ─── Self-signed certificate ───
+    # Go's TLS stack dropped Common Name fallback in 1.15, so a cert without a
+    # subjectAltName is rejected by any client that actually verifies it.
     info "Generating self-signed certificate..."
     mkdir -p "$HYSTERIA_DIR"
     openssl ecparam -genkey -name prime256v1 -out "$HYSTERIA_DIR/key.pem" 2>/dev/null
     openssl req -new -x509 -days 3650 -key "$HYSTERIA_DIR/key.pem" \
-        -out "$HYSTERIA_DIR/cert.pem" -subj "/CN=${SNI_DOMAIN}" 2>/dev/null
-    ok "Certificate generated"
+        -out "$HYSTERIA_DIR/cert.pem" -subj "/CN=${SNI_DOMAIN}" \
+        -addext "subjectAltName=DNS:${SNI_DOMAIN}" 2>/dev/null
+    chmod 600 "$HYSTERIA_DIR/key.pem"
+    ok "Certificate generated (CN + SAN: ${SNI_DOMAIN})"
 
     # ─── Config ───
     cat > "$HYSTERIA_DIR/config.yaml" <<EOF
@@ -285,7 +323,8 @@ EOF
     if systemctl is-active --quiet hysteria-server; then
         ok "Service started and enabled"
     else
-        err "Service failed to start. Check: journalctl -u hysteria-server --no-pager -n 20"
+        journalctl -u hysteria-server --no-pager -n 20 || true
+        err "Service failed to start (log above)"
     fi
 
     # ─── Multi-port iptables redirect ───
@@ -298,7 +337,8 @@ EOF
         ufw allow "${PORT}/udp" >/dev/null 2>&1 && info "UFW rule added: ${PORT}/udp"
         ufw allow "${PORT}/tcp" >/dev/null 2>&1 && info "UFW rule added: ${PORT}/tcp"
         if [[ -n "$MPORT_RANGE" ]]; then
-            ufw allow "${MPORT_RANGE}/udp" >/dev/null 2>&1 && info "UFW rule added: ${MPORT_RANGE}/udp"
+            ufw allow "$(to_colon_range "$MPORT_RANGE")/udp" >/dev/null 2>&1 \
+                && info "UFW rule added: ${MPORT_RANGE}/udp"
         fi
     fi
 
@@ -310,17 +350,23 @@ EOF
 # ─── Multi-port helpers ───
 setup_multiport_redirect() {
     local mport_range="$1" port="$2"
-    local iface
+    local iface range_colon rc=0
     iface=$(detect_iface)
+    range_colon=$(to_colon_range "$mport_range")
 
     info "Setting up multi-port redirect: ${mport_range} -> ${port}"
     if [[ -n "$iface" ]]; then
-        iptables  -t nat -A PREROUTING -i "$iface" -p udp --dport "${mport_range}" -j REDIRECT --to-ports "${port}" 2>/dev/null || true
-        ip6tables -t nat -A PREROUTING -i "$iface" -p udp --dport "${mport_range}" -j REDIRECT --to-ports "${port}" 2>/dev/null || true
+        iptables -t nat -A PREROUTING -i "$iface" -p udp --dport "$range_colon" \
+            -j REDIRECT --to-ports "$port" || rc=$?
     else
         warn "Could not detect network interface, using all interfaces"
-        iptables  -t nat -A PREROUTING -p udp --dport "${mport_range}" -j REDIRECT --to-ports "${port}" 2>/dev/null || true
-        ip6tables -t nat -A PREROUTING -p udp --dport "${mport_range}" -j REDIRECT --to-ports "${port}" 2>/dev/null || true
+        iptables -t nat -A PREROUTING -p udp --dport "$range_colon" \
+            -j REDIRECT --to-ports "$port" || rc=$?
+    fi
+
+    if (( rc != 0 )); then
+        warn "Failed to add multi-port redirect rule (rc=$rc); port hopping will not work"
+        return 0
     fi
 
     save_iptables
@@ -330,17 +376,11 @@ setup_multiport_redirect() {
 remove_multiport_redirect() {
     local port="$1"
     # Remove all PREROUTING rules that redirect to this port (reverse order to keep indices stable)
-    local rule_nums
+    local rule_nums num
     rule_nums=$(iptables -t nat -L PREROUTING --line-numbers -n 2>/dev/null \
         | grep "redir ports ${port}$" | awk '{print $1}' | sort -rn) || true
     for num in $rule_nums; do
         iptables -t nat -D PREROUTING "$num" 2>/dev/null || true
-    done
-
-    rule_nums=$(ip6tables -t nat -L PREROUTING --line-numbers -n 2>/dev/null \
-        | grep "redir ports ${port}$" | awk '{print $1}' | sort -rn) || true
-    for num in $rule_nums; do
-        ip6tables -t nat -D PREROUTING "$num" 2>/dev/null || true
     done
     save_iptables
 }
@@ -349,7 +389,6 @@ save_iptables() {
     if command -v netfilter-persistent >/dev/null 2>&1; then
         netfilter-persistent save 2>/dev/null || true
     else
-        # Pre-seed debconf to avoid interactive prompts
         echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections 2>/dev/null || true
         echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections 2>/dev/null || true
         DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent 2>/dev/null || true
@@ -370,9 +409,9 @@ show_config() {
     port=$(config_get_port)
     password=$(config_get_auth_password)
     obfs_password=$(config_get_obfs_password)
-    sni_domain=$(grep -oP '(?<=url: https://)\S+' "$HYSTERIA_DIR/config.yaml" 2>/dev/null || echo "web.max.ru")
-    # Detect multi-port from iptables
-    mport_range=$(iptables -t nat -L PREROUTING -n 2>/dev/null | grep "redir ports ${port}" | grep -oP 'udp dpts?:\K[\d:]+' | tr ':' '-' | head -1 || echo "")
+    sni_domain=$(config_get_sni)
+    mport_range=$(iptables -t nat -L PREROUTING -n 2>/dev/null \
+        | grep "redir ports ${port}" | grep -oP 'udp dpts?:\K[\d:]+' | tr ':' '-' | head -1) || mport_range=""
 
     echo ""
     info "Service status:"
@@ -390,10 +429,9 @@ change_password() {
     fi
 
     read -rp "New password: " NEW_PW
-    [[ -z "$NEW_PW" ]] && warn "Password cannot be empty" && return
+    [[ -z "$NEW_PW" ]] && { warn "Password cannot be empty"; return; }
 
-    # Use perl to avoid awk backslash interpretation
-    perl -i -pe '
+    NEW_PW="$NEW_PW" perl -i -pe '
         if (/^auth:/) { $in_auth = 1 }
         elsif (/^\S/) { $in_auth = 0 }
         if ($in_auth && s/^(  password: ).*/$1/) {
@@ -405,7 +443,6 @@ change_password() {
     systemctl restart hysteria-server
     ok "Password changed and service restarted"
 }
-export -f change_password 2>/dev/null || true
 
 # ─── Change port ───
 change_port() {
@@ -428,16 +465,15 @@ change_port() {
 
     sed -i "s|^listen: :.*|listen: :${new_port}|" "$HYSTERIA_DIR/config.yaml"
 
-    # Update UFW rules
     if command -v ufw >/dev/null 2>&1; then
         ufw delete allow "${old_port}/udp" >/dev/null 2>&1 || true
         ufw delete allow "${old_port}/tcp" >/dev/null 2>&1 || true
-        ufw allow "${new_port}/udp" >/dev/null 2>&1
-        ufw allow "${new_port}/tcp" >/dev/null 2>&1
+        ufw allow "${new_port}/udp" >/dev/null 2>&1 || true
+        ufw allow "${new_port}/tcp" >/dev/null 2>&1 || true
     fi
 
-    # Update multi-port iptables redirect if present
-    mport_range=$(iptables -t nat -L PREROUTING -n 2>/dev/null | grep "redir ports ${old_port}" | grep -oP 'udp dpts?:\K[\d:]+' | tr ':' '-' | head -1 || echo "")
+    mport_range=$(iptables -t nat -L PREROUTING -n 2>/dev/null \
+        | grep "redir ports ${old_port}" | grep -oP 'udp dpts?:\K[\d:]+' | tr ':' '-' | head -1) || mport_range=""
     if [[ -n "$mport_range" ]]; then
         info "Updating multi-port redirect: ${mport_range} -> ${new_port}"
         remove_multiport_redirect "$old_port"
@@ -453,10 +489,9 @@ uninstall_hysteria() {
     read -rp "Are you sure? This will remove Hysteria 2 completely. [y/N]: " ans
     [[ "${ans,,}" != "y" ]] && return
 
-    # Get port before removing config, to clean up iptables
     local port=""
     if [[ -f "$HYSTERIA_DIR/config.yaml" ]]; then
-        port=$(config_get_port || echo "")
+        port=$(config_get_port)
     fi
 
     systemctl stop hysteria-server 2>/dev/null || true
@@ -464,10 +499,8 @@ uninstall_hysteria() {
     rm -f "$SERVICE_FILE"
     systemctl daemon-reload
 
-    # Clean up iptables multi-port rules
     if [[ -n "$port" ]]; then
         remove_multiport_redirect "$port"
-        # Clean up UFW rules
         if command -v ufw >/dev/null 2>&1; then
             ufw delete allow "${port}/udp" >/dev/null 2>&1 || true
             ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
@@ -485,14 +518,16 @@ uninstall_hysteria() {
 print_connection_info() {
     local ip="$1" port="$2" pw="$3" obfs_pw="$4" mport="$5" sni="${6:-web.max.ru}"
 
-    # URL-encode passwords for safe URI
     local pw_enc obfs_enc
     pw_enc=$(urlencode "$pw")
     obfs_enc=$(urlencode "$obfs_pw")
 
-    local PARAMS="insecure=1&sni=${sni}&obfs=salamander&obfs-password=${obfs_enc}"
+    # allowInsecure is the Xray spelling; clients built on that parser (Throne,
+    # v2rayN) ignore the canonical `insecure`, verify the self-signed cert and
+    # fail the handshake. Emit both.
+    local PARAMS="insecure=1&allowInsecure=1&sni=${sni}&obfs=salamander&obfs-password=${obfs_enc}"
     [[ -n "$mport" ]] && PARAMS="mport=${mport}&${PARAMS}"
-    local URI="hy2://${pw_enc}@${ip}:${port}?${PARAMS}#Hysteria2"
+    local URI="hy2://${pw_enc}@${ip}:${port}/?${PARAMS}#Hysteria2"
 
     echo ""
     echo -e "${GREEN}══════════════════════════════════════${NC}"
